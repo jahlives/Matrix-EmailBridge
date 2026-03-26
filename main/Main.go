@@ -86,6 +86,24 @@ func initCfg() bool {
 
 func loginMatrix() {
 	fmt.Println("Logging into", viper.GetString("matrixserver"), "as", viper.GetString("matrixuserid"))
+
+	// If an access token is already stored, use it directly without password login
+	existingToken := viper.GetString("matrixaccesstoken")
+	if existingToken != "" {
+		fmt.Println("Found existing access token, skipping password login")
+		client, err := mautrix.NewClient(viper.GetString("matrixserver"), id.UserID(viper.GetString("matrixuserid")), existingToken)
+		if err == nil {
+			_, err = client.Whoami()
+			if err == nil {
+				fmt.Println("Access token valid, login successful")
+				matrixClient = client
+				go startMatrixSync(client)
+				return
+			}
+			fmt.Println("Access token invalid or expired, falling back to password login:", err.Error())
+		}
+	}
+
 	client, err := mautrix.NewClient(viper.GetString("matrixserver"), "", "")
 	if err != nil {
 		panic(err)
@@ -159,8 +177,15 @@ func startMatrixSync(client *mautrix.Client) {
 	})
 
 	syncer.OnEventType(event.StateMember, func(source mautrix.EventSource, evt *event.Event) {
-		if evt.Sender != client.UserID && evt.Content.AsMember().Membership == "leave" {
-			logOut(client, string(evt.RoomID), true)
+		// Ignore historical events (older than 30 seconds)
+		if evt.Unsigned.Age > 30000 {
+			return
+		}
+		// Only react if the bot itself was kicked/banned
+		if evt.StateKey != nil && id.UserID(*evt.StateKey) == client.UserID {
+			if evt.Content.AsMember().Membership == "leave" || evt.Content.AsMember().Membership == "ban" {
+				logOut(client, string(evt.RoomID), true)
+			}
 		}
 	})
 
@@ -892,10 +917,10 @@ func main() {
 }
 
 func stopMailChecker(roomID string) {
-	_, ok := listenerMap[roomID]
+	ch, ok := listenerMap[roomID]
 	if ok {
-		close(listenerMap[roomID])
-		//delete(listenerMap, evt.RoomID)
+		delete(listenerMap, roomID)
+		close(ch)
 	}
 }
 
@@ -1047,25 +1072,25 @@ func handleMail(mail *imap.Message, section *imap.BodySectionName, account imapA
 		}
 	}
 	from := html.EscapeString(content.from)
-	fmt.Println("attachments: " + content.attachment)
-	headerContent := &event.MessageEventContent{
+	// Combine header and body into a single message
+	separator := "\r\n────────────────────────────────────\r\n"
+	separatorHTML := "<br>────────────────────────────────────<br>"
+
+	plainHeader := separator + "You've got a new Email from " + from + "\r\nSubject: " + content.subject + separator
+	htmlHeader := separatorHTML + "<b>You've got a new Email</b> from <b>" + from + "</b><br>Subject: " + content.subject + separatorHTML
+
+	var combinedHTMLBody string
+	if content.htmlFormat {
+		combinedHTMLBody = htmlHeader + string(markdown.ToHTML([]byte(content.body), nil, nil))
+	} else {
+		combinedHTMLBody = htmlHeader + content.body
+	}
+
+	combinedContent := &event.MessageEventContent{
 		Format:        event.FormatHTML,
-		Body:          "\r\n────────────────────────────────────\r\n## You've got a new Email from " + from + "\r\n" + "Subject: " + content.subject + "\r\n" + "────────────────────────────────────",
-		FormattedBody: "<br>────────────────────────────────────<br><b> You've got a new Email</b> from <b>" + from + "</b><br>" + "Subject: " + content.subject + "<br>" + "────────────────────────────────────",
+		Body:          plainHeader + content.body,
+		FormattedBody: combinedHTMLBody,
 		MsgType:       event.MsgText,
 	}
-
-	matrixClient.SendMessageEvent(id.RoomID(account.roomID), event.EventMessage, &headerContent)
-
-	if content.htmlFormat {
-		bodyContent := &event.MessageEventContent{
-			Format:        event.FormatHTML,
-			Body:          content.body,
-			FormattedBody: string(markdown.ToHTML([]byte(content.body), nil, nil)),
-			MsgType:       event.MsgText,
-		}
-		matrixClient.SendMessageEvent(id.RoomID(account.roomID), event.EventMessage, &bodyContent)
-	} else {
-		matrixClient.SendText(id.RoomID(account.roomID), content.body)
-	}
+	matrixClient.SendMessageEvent(id.RoomID(account.roomID), event.EventMessage, &combinedContent)
 }
